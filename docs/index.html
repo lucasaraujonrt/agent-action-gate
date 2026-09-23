@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0b0d12">
+<meta name="description" content="Prepare the exact action, get approval outside the agent, and dispatch at most once. When a provider response is ambiguous, stop and reconcile.">
+<title>agent-action-gate — agent tools by Lucas Araujo</title>
+<link rel="stylesheet" href="./site.css">
+</head>
+<body style="--accent:#a7f3d0;--ink:#083c2d">
+<header class="top">
+<div class="wrap">
+<a class="brand" href="./">lucas<span>/</span>agent-action-gate</a>
+<nav class="nav" aria-label="Main navigation">
+<a href="#how">How it works</a>
+<a href="https://github.com/lucasaraujonrt/agent-action-gate/blob/main/README.md">README</a>
+<a href="https://github.com/lucasaraujonrt/agent-action-gate">GitHub ↗</a>
+</nav>
+</div>
+</header>
+<main>
+<div class="wrap">
+<section class="hero">
+<div>
+<span class="eyebrow">01 / APPROVAL &amp; EXECUTION</span>
+<h1>Give agents a safe path to act.</h1>
+<p class="lead">Prepare the exact action, get approval outside the agent, and dispatch at most once. When a provider response is ambiguous, stop and reconcile.</p>
+<div class="actions">
+<a class="button" href="#how">Explore the flow <span aria-hidden="true">↓</span>
+</a>
+<a class="button secondary" href="https://github.com/lucasaraujonrt/agent-action-gate">View source <span aria-hidden="true">↗</span>
+</a>
+</div>
+</div>
+<aside class="hero-side" aria-label="Project details">
+<p>Built for coding agents. The page shows the contract and a synthetic flow; the repository contains the implementation.</p>
+<span class="tag">Bun + TypeScript</span>
+<span class="tag">SQLite audit trail</span>
+<span class="tag">Library</span>
+</aside>
+</section>
+</div>
+<hr class="rule">
+<section class="section wrap">
+<div class="section-head">
+<span class="section-label">THE IDEA</span>
+<div>
+<h2>Why does an agent need a gate?</h2>
+<p class="section-intro">An agent can propose a useful action without being trusted to authorize it. The gate binds review to an input hash, claims the approved action atomically, and records what happened.</p>
+</div>
+</div>
+<div class="cards">
+<article class="card">
+<span class="index">01</span>
+<h3>Bounded proposal</h3>
+<p>prepare() persists the actor, action, input hash, and idempotency key.</p>
+</article>
+<article class="card">
+<span class="index">02</span>
+<h3>Separate review</h3>
+<p>approve() belongs behind a host-owned, authenticated review surface.</p>
+</article>
+<article class="card">
+<span class="index">03</span>
+<h3>Uncertain result</h3>
+<p>execute() never assumes a network error means the provider did nothing.</p>
+</article>
+</div>
+</section>
+<hr class="rule">
+<section class="section wrap" id="how">
+<div class="section-head">
+<span class="section-label">STATE WALKTHROUGH</span>
+<div>
+<h2>See the states an agent handles.</h2>
+<p class="section-intro">Select a step to inspect a possible state. Every value here is fictional.</p>
+</div>
+</div>
+<div class="demo">
+<div class="demo-nav" role="group" aria-label="Example flow steps">
+<button class="demo-step" type="button" aria-pressed="false" data-state="pending" data-output="{&quot;action&quot;:&quot;pause-campaign&quot;,&quot;inputHash&quot;:&quot;sha256:demo…&quot;,&quot;status&quot;:&quot;pending&quot;}">
+<span class="num">01</span>Prepare</button>
+<button class="demo-step" type="button" aria-pressed="false" data-state="approved" data-output="{&quot;reviewer&quot;:&quot;demo-reviewer&quot;,&quot;status&quot;:&quot;approved&quot;}">
+<span class="num">02</span>Approve</button>
+<button class="demo-step" type="button" aria-pressed="false" data-state="succeeded" data-output="{&quot;providerId&quot;:&quot;demo-123&quot;,&quot;status&quot;:&quot;succeeded&quot;}">
+<span class="num">03</span>Execute</button>
+<button class="demo-step" type="button" aria-pressed="false" data-state="uncertain" data-output="{&quot;status&quot;:&quot;uncertain&quot;,&quot;next&quot;:&quot;inspect provider, then reconcile&quot;}">
+<span class="num">04</span>Timeout</button>
+</div>
+<div class="demo-view">
+<div class="demo-top">
+<span class="demo-caption">Example output</span>
+<span class="pill" id="demo-state" aria-live="polite">
+</span>
+</div>
+<pre id="demo-output" aria-live="polite">
+</pre>
+<p class="demo-note">Synthetic example. No provider call, charge, or data write occurs on this page.</p>
+</div>
+</div>
+</section>
+<section class="wrap" style="padding-bottom:84px">
+<div class="boundary">
+<span class="section-label">THE BOUNDARY</span>
+<p>The host authenticates reviewers. After an ambiguous provider result, the agent must inspect the provider before reconciliation.</p>
+</div>
+</section>
+<section class="end">
+<div class="wrap">
+<h2>See the implementation and its limits.</h2>
+<a class="button" href="https://github.com/lucasaraujonrt/agent-action-gate/blob/main/docs/architecture.md">Read the API and failure model ↗</a>
+</div>
+</section>
+</main>
+<footer class="footer">
+<div class="wrap">
+<span>Open source by Lucas Araujo · agent-action-gate</span>
+<span>
+<a href="https://github.com/lucasaraujonrt/agent-action-gate">Source</a> · <a href="https://github.com/lucasaraujonrt/agent-action-gate/blob/main/README.md">Setup</a> · <a href="https://github.com/lucasaraujonrt/agent-action-gate/blob/main/LICENSE">License</a>
+</span>
+</div>
+</footer>
+<script src="./site.js" defer>
+</script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 # Agent Action Gate
 
+**Project site:** https://lucasaraujonrt.github.io/agent-action-gate/
 A Bun/TypeScript library for agent actions that need explicit approval and at-most-once dispatch. It was generalized from approval-gated actions built for Inker's Kitsune assistant.
 
 An agent can prepare an action and show the exact input hash. A separate approver accepts that hash. Only then can the application dispatch the action. A network error after dispatch leaves the action **uncertain**, so the agent must reconcile with the external provider instead of submitting again.
