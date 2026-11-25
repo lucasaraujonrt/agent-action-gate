@@ -182,14 +182,14 @@ describe('ApprovalLinks issue', () => {
     expect(() => links.issue(action.id)).toThrow('expired');
   });
 
-  test('a locked action cannot get a new link', async () => {
-    const { gate, links, prepare } = setup({ limits: { maxPinFailures: 2 } });
+  test('a locked action cannot get a new link, even while the gate still shows it pending', async () => {
+    const { gate, links, prepare } = setup({ limits: { maxPinFailures: 2 }, failFirstDecision: true });
     const action = prepare();
     const { token } = links.issue(action.id);
     await links.approve(action.id, token, WRONG, 'alice');
     expect(await links.approve(action.id, token, WRONG, 'alice')).toEqual({ ok: false, reason: 'pin_lockout' });
-    expect(() => links.issue(action.id)).toThrow();
-    expect(gate.get(action.id).status).toBe('rejected');
+    expect(gate.get(action.id).status).toBe('pending');
+    expect(() => links.issue(action.id)).toThrow('locked');
   });
 
   test('re-issuing keeps the wrong-PIN count of the action', async () => {
@@ -287,6 +287,18 @@ describe('ApprovalLinks decisions', () => {
     expect(links.view(action.id, token)).toBeNull();
     expect((await links.approve(action.id, token, PIN, 'alice')).ok).toBe(false);
     expect(approvedEvents(gate, action.id)).toBe(0);
+  });
+
+  test('there is no option that skips the PIN check', async () => {
+    const { gate, prepare, clock } = setup();
+    const links = new ApprovalLinks({
+      gate, pinHash, now: () => clock.now, verifyPin: async () => true,
+    } as ConstructorParameters<typeof ApprovalLinks>[0]);
+    cleanup.push(() => links.close());
+    const action = prepare();
+    const { token } = links.issue(action.id);
+    expect(await links.approve(action.id, token, WRONG, 'alice')).toMatchObject({ ok: false, reason: 'wrong_pin' });
+    expect(gate.get(action.id).status).toBe('pending');
   });
 
   test('a right PIN after four wrong ones still works', async () => {
