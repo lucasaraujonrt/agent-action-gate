@@ -17,6 +17,7 @@
 <nav aria-label="Project links">
 <a href="#mechanism">Mechanism</a>
 <a href="#failure">Failure contract</a>
+<a href="#approval-links">Approval links</a>
 <a href="https://github.com/lucasaraujonrt/agent-action-gate">GitHub ↗</a>
 </nav>
 </header>
@@ -145,6 +146,20 @@ const result = await gate.execute(proposal.id, operation);</code>
 <p>If the process dies while executing, an operator checks the provider, marks the interrupted action uncertain, and records the verified outcome. The library does not guess what happened remotely.</p>
 </div>
 </div>
+</section>
+<section class="example wrap" id="approval-links">
+<div>
+<div class="section-label">04 / Approval links</div>
+<h2>Approve from a phone with a one-time link and a PIN.</h2>
+<p>The link carries a random token and works once. The PIN is a second factor, checked before anything is decided. Five wrong PINs lock the action and reject it, and the count follows the action across new links.</p>
+<p>A link expires at the earlier of its own lifetime and the action's expiry. It proves that someone with the link and the PIN decided, not who.</p>
+</div>
+<pre>
+<code>const links = new ApprovalLinks({ gate, pinHash, path: './links.db' });
+const { token } = links.issue(proposal.id);
+// Send the link yourself, then serve the handler:
+Bun.serve({ fetch: createApprovalHandler(links) });</code>
+</pre>
 </section>
 <section class="closing wrap">
 <p>Built for a trusted host that needs an audit trail around agent actions. Local Bun SQLite, no distributed workflow engine.</p>

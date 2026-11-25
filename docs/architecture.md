@@ -18,3 +18,17 @@ The database contains an append-only `action_events` table for the local audit v
 | Process dies while executing | Operator checks provider, then marks uncertain and reconciles |
 
 Each SQLite state transition and corresponding audit event is committed in one transaction. Do not use this package as a distributed workflow engine or as the sole source of truth for an external provider's state.
+
+## Approval links
+
+`ApprovalLinks` sits in front of `approve` and `reject`. It keeps its own SQLite tables: one row per action (token hash, input hash, expiry, wrong-PIN count, status), a short log of recent wrong PINs, and a global lock. The token is stored as a hash and cleared when the link is used.
+
+A decision runs in three steps. First one transaction checks the token and expiry and reserves a PIN attempt, so parallel guesses cannot all reach the slow PIN check. Then the PIN is checked. Then a second transaction consumes the link before the gate is called, so two requests with a correct PIN cannot both decide.
+
+| Failure | Result |
+|---|---|
+| Wrong or reused token | Nothing changes, the response looks like an unknown link |
+| Wrong PIN limit reached | Link locked and action rejected, `issue` refuses it from then on |
+| Process dies after reserving the last attempt | Next request locks the link and rejects the action |
+| Process dies after consuming the link, before the gate call | Action stays pending, `issue` replaces the used link |
+| Link older than the action | Cannot exist: expiry is capped at the action's own |

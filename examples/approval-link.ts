@@ -17,8 +17,9 @@ const action = gate.prepare({
   action: 'send-message',
   input: { to: 'team-channel', text: 'Deploy finished' },
   idempotencyKey: `demo-${Date.now()}`,
-  ttlMs: 72 * 60 * 60_000,
+  ttlMs: 24 * 60 * 60_000,
 });
+// The link expires at the earlier of its own ttl (72 hours) and the action's expiry (24 hours here).
 const { token, expiresAt } = links.issue(action.id);
 
 const handler = createApprovalHandler(links, {
