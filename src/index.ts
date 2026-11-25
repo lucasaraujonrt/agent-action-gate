@@ -228,3 +228,5 @@ export class ActionGate {
     this.db.close();
   }
 }
+
+export * from './approval-link';
