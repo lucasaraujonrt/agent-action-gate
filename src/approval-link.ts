@@ -1,4 +1,4 @@
-import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import crypto, { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -15,7 +15,7 @@ export interface ParsedPinHash {
 
 function derive(pin: string, salt: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    scryptCb(pin, salt, KEY_LENGTH, (error, key) => (error ? reject(error) : resolve(key)));
+    crypto.scrypt(pin, salt, KEY_LENGTH, (error, key) => (error ? reject(error) : resolve(key)));
   });
 }
 
@@ -59,8 +59,6 @@ export interface ApprovalLinksOptions {
   path?: string;
   now?: () => number;
   limits?: Partial<ApprovalLimits>;
-  /** Replaces the scrypt check. Meant for tests that count or stub PIN verification. */
-  verifyPin?: (pin: string | undefined, stored: ParsedPinHash) => Promise<boolean>;
 }
 
 type Failure = 'not_found' | 'invalid_token' | 'expired' | 'pin_lockout' | 'locked' | 'unavailable';
@@ -79,7 +77,9 @@ interface LinkRow {
   status: LinkStatus;
 }
 
-type Reservation = { ok: true; attemptId: number; inputHash: string } | { ok: false; reason: Failure };
+type Reservation =
+  | { ok: true; attemptId: number; inputHash: string }
+  | { ok: false; reason: Failure; closed?: true };
 
 const DEFAULT_LIMITS: ApprovalLimits = {
   linkTtlMs: 72 * HOUR_MS,
@@ -102,7 +102,6 @@ export class ApprovalLinks {
   private readonly pin: ParsedPinHash;
   private readonly now: () => number;
   private readonly limits: ApprovalLimits;
-  private readonly verify: NonNullable<ApprovalLinksOptions['verifyPin']>;
 
   constructor(options: ApprovalLinksOptions) {
     const path = options.path ?? ':memory:';
@@ -110,7 +109,6 @@ export class ApprovalLinks {
     this.pin = parsePinHash(options.pinHash);
     this.now = options.now ?? Date.now;
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
-    this.verify = options.verifyPin ?? verifyPin;
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path, { create: true });
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;');
@@ -134,18 +132,26 @@ export class ApprovalLinks {
     `);
   }
 
+  /**
+   * Replaces any earlier link for the action. Refuses a locked action, and keeps its wrong-PIN count:
+   * the budget belongs to the action, not to a link.
+   */
   issue(actionId: string): { token: string; expiresAt: number } {
     const record = this.gate.get(actionId);
     if (record.status !== 'pending') throw new Error('action is not pending');
+    const now = this.now();
+    if (record.expiresAt <= now) throw new Error('action has expired');
     const token = randomBytes(32).toString('base64url');
-    const expiresAt = this.now() + this.limits.linkTtlMs;
-    this.db.prepare(`
-      INSERT INTO approval_links (action_id, token_hash, input_hash, expires_at, pin_failures, status)
-      VALUES (?, ?, ?, ?, 0, 'open')
-      ON CONFLICT(action_id) DO UPDATE SET
-        token_hash=excluded.token_hash, input_hash=excluded.input_hash, expires_at=excluded.expires_at,
-        pin_failures=0, status='open'
-    `).run(actionId, sha256(token), record.inputHash, expiresAt);
+    const expiresAt = Math.min(now + this.limits.linkTtlMs, record.expiresAt);
+    this.db.transaction(() => {
+      if (this.row(actionId)?.status === 'locked') throw new Error('action is locked after too many wrong PINs');
+      this.db.prepare(`
+        INSERT INTO approval_links (action_id, token_hash, input_hash, expires_at, pin_failures, status)
+        VALUES (?, ?, ?, ?, 0, 'open')
+        ON CONFLICT(action_id) DO UPDATE SET
+          token_hash=excluded.token_hash, input_hash=excluded.input_hash, expires_at=excluded.expires_at, status='open'
+      `).run(actionId, sha256(token), record.inputHash, expiresAt);
+    }).immediate();
     return { token, expiresAt };
   }
 
@@ -186,9 +192,12 @@ export class ApprovalLinks {
   ): Promise<ApprovalResult> {
     const tokenHash = sha256(token ?? '');
     const reservation = this.reserve(actionId, tokenHash);
-    if (!reservation.ok) return reservation;
+    if (!reservation.ok) {
+      if (reservation.closed) this.rejectAfterLockout(actionId);
+      return { ok: false, reason: reservation.reason };
+    }
 
-    if (!(await this.verify(pin, this.pin))) return this.wrongPin(actionId, tokenHash);
+    if (!(await verifyPin(pin, this.pin))) return this.wrongPin(actionId, tokenHash);
 
     const consumed = this.consume(actionId, tokenHash, reservation.attemptId);
     if (consumed !== 'ok') return { ok: false, reason: consumed };
@@ -204,7 +213,9 @@ export class ApprovalLinks {
       const now = this.now();
       const row = this.row(actionId);
       if (!row) return { ok: false, reason: 'not_found' };
-      if (row.status !== 'open' || !sameHash(row.token_hash, tokenHash)) return { ok: false, reason: 'invalid_token' };
+      if (!sameHash(row.token_hash, tokenHash)) return { ok: false, reason: 'invalid_token' };
+      if (row.status === 'locked') return { ok: false, reason: 'pin_lockout' };
+      if (row.status !== 'open') return { ok: false, reason: 'invalid_token' };
       if (row.expires_at <= now) {
         this.db.prepare("UPDATE approval_links SET status='expired', token_hash=NULL WHERE action_id=? AND status='open'").run(actionId);
         return { ok: false, reason: 'expired' };
@@ -217,7 +228,12 @@ export class ApprovalLinks {
         UPDATE approval_links SET pin_failures=pin_failures+1
         WHERE action_id=? AND token_hash=? AND status='open' AND pin_failures<?
       `).run(actionId, tokenHash, this.limits.maxPinFailures).changes;
-      if (reserved !== 1) return { ok: false, reason: 'pin_lockout' };
+      if (reserved !== 1) {
+        // The budget is spent but the link is still open: a process died between reserving the last
+        // attempt and recording its failure. Close the link here instead of leaving it open.
+        this.db.prepare("UPDATE approval_links SET status='locked' WHERE action_id=? AND status='open'").run(actionId);
+        return { ok: false, reason: 'pin_lockout', closed: true };
+      }
       const attempt = this.db.prepare('INSERT INTO approval_pin_attempts (at) VALUES (?)').run(now);
       return { ok: true, attemptId: Number(attempt.lastInsertRowid), inputHash: row.input_hash };
     }).immediate();
@@ -253,16 +269,20 @@ export class ApprovalLinks {
       if (row.pin_failures < this.limits.maxPinFailures) {
         return { ok: false, reason: 'wrong_pin', remaining: this.limits.maxPinFailures - row.pin_failures };
       }
-      this.db.prepare("UPDATE approval_links SET status='locked', token_hash=NULL WHERE action_id=?").run(actionId);
+      this.db.prepare("UPDATE approval_links SET status='locked' WHERE action_id=?").run(actionId);
       return { ok: false, reason: 'pin_lockout', closed: true };
     }).immediate();
     if (!('closed' in outcome)) return outcome;
+    this.rejectAfterLockout(actionId);
+    return { ok: false, reason: 'pin_lockout' };
+  }
+
+  private rejectAfterLockout(actionId: string): void {
     try {
       this.gate.reject(actionId, 'approval-link:pin-lockout');
     } catch {
       // The action was decided another way in the meantime; the link is closed either way.
     }
-    return { ok: false, reason: 'pin_lockout' };
   }
 
   private row(actionId: string): LinkRow | null {
@@ -294,11 +314,36 @@ const SECURITY_HEADERS: Record<string, string> = {
   'Content-Type': 'text/html; charset=utf-8',
   'Cache-Control': 'no-store',
   'Referrer-Policy': 'no-referrer',
+  'X-Content-Type-Options': 'nosniff',
   'X-Robots-Tag': 'noindex, nofollow',
   'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 };
 
-const MAX_BODY_CHARS = 2048;
+const MAX_BODY_BYTES = 2048;
+
+/** Reads at most `limit` bytes of the body. Returns null, and stops reading, when the body is longer. */
+async function readBounded(request: Request, limit: number): Promise<string | null> {
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > limit) {
+    void request.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      void reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
@@ -383,8 +428,8 @@ export function createApprovalHandler(
       return respond(405, message('Method not allowed', 'Use GET or POST.'), { Allow: 'GET, POST' });
     }
 
-    const raw = await request.text();
-    if (raw.length > MAX_BODY_CHARS) return respond(413, message('Request too large', 'Reload the page and try again.'));
+    const raw = await readBounded(request, MAX_BODY_BYTES);
+    if (raw === null) return respond(413, message('Request too large', 'Reload the page and try again.'));
     const form = new URLSearchParams(raw);
     const decision = form.get('action');
     if (decision !== 'approve' && decision !== 'reject') {

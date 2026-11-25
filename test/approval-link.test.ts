@@ -1,4 +1,5 @@
-import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
+import { afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import crypto from 'node:crypto';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,8 +27,25 @@ afterEach(() => cleanup.splice(0).forEach((fn) => fn()));
 interface Options {
   limits?: Partial<ApprovalLimits>;
   onFile?: boolean;
-  verifyCalls?: { count: number };
+  gateTtlMs?: number;
+  /** Makes the first gate decision throw, as if the process died after the link was consumed. */
+  failFirstDecision?: boolean;
 }
+
+function scryptCounter() {
+  const spy = spyOn(crypto, 'scrypt');
+  cleanup.push(() => spy.mockRestore());
+  return { get count() { return spy.mock.calls.length; }, reset: () => spy.mockClear() };
+}
+
+function rawLinks(path: string) {
+  const db = new Database(path);
+  cleanup.push(() => db.close());
+  return db;
+}
+
+const linkRow = (path: string, id: string) =>
+  rawLinks(path).query('SELECT status, pin_failures FROM approval_links WHERE action_id=?').get(id) as { status: string; pin_failures: number };
 
 function setup(options: Options = {}) {
   let path = ':memory:';
@@ -40,23 +58,26 @@ function setup(options: Options = {}) {
   }
   const gate = new ActionGate(gatePath);
   const clock = { now: Date.now() };
+  let failures = options.failFirstDecision ? 1 : 0;
+  const decide = <T>(run: () => T): T => {
+    if (failures > 0) { failures--; throw new Error('simulated crash'); }
+    return run();
+  };
   const links = new ApprovalLinks({
-    gate,
+    gate: {
+      get: (id) => gate.get(id),
+      approve: (id, approver, hash) => decide(() => gate.approve(id, approver, hash)),
+      reject: (id, approver) => decide(() => gate.reject(id, approver)),
+    },
     pinHash,
     path,
     now: () => clock.now,
     limits: options.limits,
-    verifyPin: options.verifyCalls
-      ? (pin, stored) => {
-          options.verifyCalls!.count++;
-          return verifyPin(pin, stored);
-        }
-      : undefined,
   });
   cleanup.push(() => { links.close(); gate.close(); });
   let sequence = 0;
   const prepare = (input: unknown = { text: 'hello' }) =>
-    gate.prepare({ actor: 'agent', action: 'send-message', input, idempotencyKey: `call-${++sequence}` });
+    gate.prepare({ actor: 'agent', action: 'send-message', input, idempotencyKey: `call-${++sequence}`, ttlMs: options.gateTtlMs });
   return { gate, links, clock, prepare, gatePath, path };
 }
 
@@ -136,6 +157,67 @@ describe('ApprovalLinks token', () => {
   });
 });
 
+describe('ApprovalLinks issue', () => {
+  test('a link never outlives the action it approves', async () => {
+    const { gate, links, clock, prepare } = setup({ gateTtlMs: 10 * 60_000 });
+    const action = prepare();
+    const { token, expiresAt } = links.issue(action.id);
+    expect(expiresAt).toBe(action.expiresAt);
+    expect(expiresAt).toBeLessThan(clock.now + 72 * 60 * 60_000);
+
+    const shortLived = setup({ gateTtlMs: 10 * 60_000, limits: { linkTtlMs: 60_000 } });
+    const other = shortLived.prepare();
+    expect(shortLived.links.issue(other.id).expiresAt).toBe(shortLived.clock.now + 60_000);
+
+    clock.now = action.expiresAt;
+    expect(links.view(action.id, token)).toBeNull();
+    expect(await links.approve(action.id, token, PIN, 'alice')).toEqual({ ok: false, reason: 'expired' });
+    expect(gate.get(action.id).status).toBe('pending');
+  });
+
+  test('issue refuses an action whose own expiry has passed', () => {
+    const { links, clock, prepare } = setup({ gateTtlMs: 1000 });
+    const action = prepare();
+    clock.now = action.expiresAt;
+    expect(() => links.issue(action.id)).toThrow('expired');
+  });
+
+  test('a locked action cannot get a new link', async () => {
+    const { gate, links, prepare } = setup({ limits: { maxPinFailures: 2 } });
+    const action = prepare();
+    const { token } = links.issue(action.id);
+    await links.approve(action.id, token, WRONG, 'alice');
+    expect(await links.approve(action.id, token, WRONG, 'alice')).toEqual({ ok: false, reason: 'pin_lockout' });
+    expect(() => links.issue(action.id)).toThrow();
+    expect(gate.get(action.id).status).toBe('rejected');
+  });
+
+  test('re-issuing keeps the wrong-PIN count of the action', async () => {
+    const { links, prepare } = setup({ limits: { maxPinFailures: 3 } });
+    const action = prepare();
+    const first = links.issue(action.id);
+    expect(await links.approve(action.id, first.token, WRONG, 'alice')).toMatchObject({ reason: 'wrong_pin', remaining: 2 });
+    expect(await links.approve(action.id, first.token, WRONG, 'alice')).toMatchObject({ reason: 'wrong_pin', remaining: 1 });
+
+    const second = links.issue(action.id);
+    expect(await links.approve(action.id, second.token, WRONG, 'alice')).toEqual({ ok: false, reason: 'pin_lockout' });
+  });
+
+  test('a correct PIN is refunded, so a recovery link keeps the count of wrong PINs only', async () => {
+    const { gate, links, prepare } = setup({ failFirstDecision: true });
+    const action = prepare();
+    const first = links.issue(action.id);
+    await links.approve(action.id, first.token, WRONG, 'alice');
+    await links.approve(action.id, first.token, WRONG, 'alice');
+    expect(await links.approve(action.id, first.token, PIN, 'alice')).toEqual({ ok: false, reason: 'unavailable' });
+    expect(gate.get(action.id).status).toBe('pending');
+
+    const recovery = links.issue(action.id);
+    expect(await links.approve(action.id, recovery.token, WRONG, 'alice')).toEqual({ ok: false, reason: 'wrong_pin', remaining: 2 });
+    expect((await links.approve(action.id, recovery.token, PIN, 'alice')).ok).toBe(true);
+  });
+});
+
 describe('ApprovalLinks decisions', () => {
   test('two concurrent approvals approve exactly once', async () => {
     const { gate, links, prepare } = setup();
@@ -159,7 +241,9 @@ describe('ApprovalLinks decisions', () => {
       links.reject(action.id, token, PIN, 'bob'),
     ]);
     expect(results.filter((result) => result.ok)).toHaveLength(1);
-    expect(['approved', 'rejected']).toContain(gate.get(action.id).status);
+    const winner = results.findIndex((result) => result.ok);
+    expect(gate.get(action.id).status).toBe(winner === 0 ? 'approved' : 'rejected');
+    expect(gate.history(action.id).map((event) => event.kind)).toEqual(['prepared', winner === 0 ? 'approved' : 'rejected']);
   });
 
   test('reject with the right PIN rejects the action', async () => {
@@ -169,6 +253,17 @@ describe('ApprovalLinks decisions', () => {
     const result = await links.reject(action.id, token, PIN, 'alice');
     expect(result.ok && result.record.status).toBe('rejected');
     expect(gate.get(action.id).approvedBy).toBe('alice');
+  });
+
+  test('reject needs the PIN too, and wrong PINs on reject lock the link', async () => {
+    const { gate, links, prepare } = setup({ limits: { maxPinFailures: 2 } });
+    const action = prepare();
+    const { token } = links.issue(action.id);
+    expect(await links.reject(action.id, token, WRONG, 'mallory')).toEqual({ ok: false, reason: 'wrong_pin', remaining: 1 });
+    expect(gate.get(action.id).status).toBe('pending');
+    expect(await links.reject(action.id, token, WRONG, 'mallory')).toEqual({ ok: false, reason: 'pin_lockout' });
+    expect(gate.get(action.id)).toMatchObject({ status: 'rejected', approvedBy: 'approval-link:pin-lockout' });
+    expect((await links.approve(action.id, token, PIN, 'alice')).ok).toBe(false);
   });
 
   test('a wrong PIN does not decide and the right PIN does', async () => {
@@ -232,27 +327,67 @@ describe('ApprovalLinks decisions', () => {
   });
 
   test('50 parallel wrong-PIN decisions run the PIN check at most maxPinFailures times', async () => {
-    const verifyCalls = { count: 0 };
-    const { gate, links, prepare } = setup({ verifyCalls });
+    const scrypt = scryptCounter();
+    const { gate, links, prepare } = setup();
     const action = prepare();
     const { token } = links.issue(action.id);
+    scrypt.reset();
     const results = await Promise.all(Array.from({ length: 50 }, () => links.approve(action.id, token, WRONG, 'alice')));
 
-    expect(verifyCalls.count).toBe(5);
+    expect(scrypt.count).toBe(5);
     expect(results.every((result) => !result.ok)).toBe(true);
     expect(results.filter((result) => !result.ok && result.reason === 'pin_lockout').length).toBeGreaterThanOrEqual(45);
     expect(results.every((result) => !result.ok && ['wrong_pin', 'pin_lockout'].includes(result.reason))).toBe(true);
     expect(gate.get(action.id).status).toBe('rejected');
   });
 
-  test('parallel guesses with a correct PIN among them approve at most once', async () => {
+  test('parallel guesses with a correct PIN among them approve exactly once', async () => {
     const { gate, links, prepare } = setup();
     const action = prepare();
     const { token } = links.issue(action.id);
-    const pins = [WRONG, WRONG, PIN, WRONG, PIN, WRONG];
+    const pins = [WRONG, PIN, PIN, WRONG];
     const results = await Promise.all(pins.map((pin) => links.approve(action.id, token, pin, 'alice')));
-    expect(results.filter((result) => result.ok).length).toBeLessThanOrEqual(1);
-    expect(approvedEvents(gate, action.id)).toBeLessThanOrEqual(1);
+
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(gate.get(action.id)).toMatchObject({ status: 'approved', approvedBy: 'alice' });
+    expect(approvedEvents(gate, action.id)).toBe(1);
+    for (const result of results.filter((result) => !result.ok)) {
+      expect(['wrong_pin', 'invalid_token']).toContain(result.ok ? 'ok' : result.reason);
+    }
+  });
+
+  test('a link left open with its attempts spent is closed and the action rejected', async () => {
+    const scrypt = scryptCounter();
+    const { gate, links, prepare, path } = setup({ onFile: true });
+    const action = prepare();
+    const { token } = links.issue(action.id);
+    rawLinks(path).prepare('UPDATE approval_links SET pin_failures=5 WHERE action_id=?').run(action.id);
+    scrypt.reset();
+
+    expect(await links.approve(action.id, token, PIN, 'alice')).toEqual({ ok: false, reason: 'pin_lockout' });
+    expect(scrypt.count).toBe(0);
+    expect(gate.get(action.id).status).toBe('rejected');
+    expect(linkRow(path, action.id).status).toBe('locked');
+    expect(links.view(action.id, token)).toBeNull();
+    expect(approvedEvents(gate, action.id)).toBe(0);
+    expect(() => links.issue(action.id)).toThrow();
+  });
+
+  test('two instances on one database file approve once between them', async () => {
+    const { gate, links, prepare, path, gatePath, clock } = setup({ onFile: true });
+    const action = prepare();
+    const { token } = links.issue(action.id);
+    const otherGate = new ActionGate(gatePath);
+    const otherLinks = new ApprovalLinks({ gate: otherGate, pinHash, path, now: () => clock.now });
+    cleanup.push(() => { otherLinks.close(); otherGate.close(); });
+
+    const results = await Promise.all([
+      links.approve(action.id, token, PIN, 'alice'),
+      otherLinks.approve(action.id, token, PIN, 'bob'),
+    ]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.find((result) => !result.ok)).toEqual({ ok: false, reason: 'invalid_token' });
+    expect(approvedEvents(gate, action.id)).toBe(1);
   });
 });
 
@@ -329,6 +464,7 @@ describe('createApprovalHandler', () => {
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(response.headers.get('referrer-policy')).toBe('no-referrer');
     expect(response.headers.get('x-robots-tag')).toContain('noindex');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
   };
 
   test('GET renders the action with security headers and escapes values', async () => {
@@ -383,9 +519,11 @@ describe('createApprovalHandler', () => {
     const action = prepare();
     const { token } = links.issue(action.id);
     const decisions: string[] = [];
+    let decided!: () => void;
+    const onDecisionRan = new Promise<void>((resolve) => { decided = resolve; });
     const handler = createApprovalHandler(links, {
       approver: 'phone',
-      onDecision: (record, decision) => { decisions.push(`${record.id}:${decision}`); },
+      onDecision: (record, decision) => { decisions.push(`${record.id}:${decision}`); decided(); },
     });
     const path = `/approve/${action.id}`;
 
@@ -399,7 +537,7 @@ describe('createApprovalHandler', () => {
     expect(right.status).toBe(200);
     expectSecurityHeaders(right);
     expect(gate.get(action.id)).toMatchObject({ status: 'approved', approvedBy: 'phone' });
-    await Promise.resolve();
+    await onDecisionRan;
     expect(decisions).toEqual([`${action.id}:approve`]);
 
     const again = await handler(post(path, { t: token, pin: PIN, action: 'approve' }));
@@ -414,7 +552,6 @@ describe('createApprovalHandler', () => {
     const path = `/approve/${action.id}`;
 
     expect((await handler(post(path, { t: token, pin: PIN, action: 'launch' }))).status).toBe(400);
-    expect((await handler(post(path, { t: token, pin: 'x'.repeat(5000), action: 'approve' }))).status).toBe(413);
     const put = await handler(new Request(`${origin}${path}`, { method: 'PUT' }));
     expect(put.status).toBe(405);
     expectSecurityHeaders(put);
@@ -422,6 +559,59 @@ describe('createApprovalHandler', () => {
     const rejected = await handler(post(path, { t: token, pin: PIN, action: 'reject' }));
     expect(rejected.status).toBe(200);
     expect(gate.get(action.id).status).toBe('rejected');
+  });
+
+  test('GET escapes the actor and action names', async () => {
+    const { gate, links } = setup();
+    const action = gate.prepare({ actor: '<b>agent</b>', action: '"><i>pay</i>', input: { n: 1 }, idempotencyKey: 'escape-1' });
+    const { token } = links.issue(action.id);
+    const html = await (await createApprovalHandler(links)(new Request(`${origin}/approve/${action.id}?t=${token}`))).text();
+    expect(html).not.toContain('<b>agent');
+    expect(html).not.toContain('<i>pay');
+    expect(html).toContain('&#60;b&#62;agent&#60;/b&#62;');
+    expect(html).toContain('&#34;&#62;&#60;i&#62;pay');
+  });
+
+  test('an oversized body is refused with 413 and approves nothing', async () => {
+    const { gate, links, prepare } = setup();
+    const action = prepare();
+    const { token } = links.issue(action.id);
+    const handler = createApprovalHandler(links);
+    const path = `/approve/${action.id}`;
+    const valid = new URLSearchParams({ t: token, pin: PIN, action: 'approve' }).toString();
+
+    const declared = await handler(post(path, { t: token, pin: 'x'.repeat(5000), action: 'approve' }));
+    expect(declared.status).toBe(413);
+    expectSecurityHeaders(declared);
+
+    let pulls = 0;
+    const chunk = new TextEncoder().encode('x'.repeat(1000));
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) { pulls++; controller.enqueue(chunk); },
+    });
+    const chunked = await handler(new Request(`${origin}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: endless,
+      duplex: 'half',
+    } as RequestInit));
+    expect(chunked.status).toBe(413);
+    expect(pulls).toBeLessThan(10);
+
+    let bodyPulls = 0;
+    const lying = new ReadableStream<Uint8Array>({
+      pull(controller) { bodyPulls++; controller.enqueue(new TextEncoder().encode(valid)); controller.close(); },
+    });
+    const withLength = await handler(new Request(`${origin}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': '5000' },
+      body: lying,
+      duplex: 'half',
+    } as RequestInit));
+    expect(withLength.status).toBe(413);
+    expect(bodyPulls).toBe(0);
+    expect(gate.get(action.id).status).toBe('pending');
+    expect((await links.approve(action.id, token, PIN, 'alice')).ok).toBe(true);
   });
 
   test('lockout and global lock map to 403 and 429', async () => {
